@@ -1,0 +1,226 @@
+networks:
+  data_collection_network:
+    external: true
+    name: data_collection_network
+
+services:
+  setup:
+    build:
+      context: .
+      dockerfile: Dockerfile_setup
+    volumes:
+      - ./certs:/usr/share/elasticsearch/config/certs
+    networks:
+      - data_collection_network
+    user: "0"
+    command: >
+      bash -c '
+        if [ x${ELASTIC_PASSWORD} == x ]; then
+          echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
+          exit 1;
+        elif [ x${KIBANA_PASSWORD} == x ]; then
+          echo "Set the KIBANA_PASSWORD environment variable in the .env file";
+          exit 1;
+        fi;
+
+        if [ ! -f config/certs/elastic-ca.p12 ]; then
+          echo "Creating CA";
+          keytool -genkeypair \
+           -alias elastic-ca \
+           -keyalg RSA \
+           -keysize 2048 \
+           -sigalg SHA256withRSA \
+           -dname "CN=Elastic CA, O=Example, C=KR" \
+           -validity 3650 \
+           -storetype PKCS12 \
+           -keystore config/certs/elastic-ca.p12 \
+           -storepass ${CA_PASSWORD} \
+           -ext BasicConstraints:critical=ca:true,pathlen:1 \
+           -ext KeyUsage:critical=keyCertSign,cRLSign \
+           -keypass ${CA_PASSWORD}
+        fi;
+
+        if [ ! -f config/certs/es01.csr ]; then
+          echo "Creating CSR";
+          keytool -genkeypair \
+           -alias es01 \
+           -keyalg RSA \
+           -keysize 2048 \
+           -sigalg SHA256withRSA \
+           -dname "CN=es01, O=Example, C=KR" \
+           -validity 825 \
+           -storepass "${CERT_PASSWORD}" \
+           -keypass "${CERT_PASSWORD}" \
+           -keystore config/certs/es01-keystore.jks \
+           -storetype JKS
+          keytool -certreq \
+           -alias es01 \
+           -keystore config/certs/es01-keystore.jks \
+           -storepass "${CERT_PASSWORD}" \
+           -file config/certs/es01.csr
+        fi;
+
+        if [ ! -f config/certs/es01.crt ]; then
+          echo "Signing CSR with CA";
+          keytool -gencert \
+           -alias elastic-ca \
+           -keystore config/certs/elastic-ca.p12 \
+           -storetype PKCS12 \
+           -storepass ${CA_PASSWORD} \
+           -outfile config/certs/es01.crt \
+           -validity 825 \
+           -rfc \
+           -ext KeyUsage:critical=digitalSignature,keyEncipherment \
+           -ext ExtendedKeyUsage:critical=serverAuth,clientAuth \
+           -infile config/certs/es01.csr
+        fi;
+        
+        if [ ! -f config/certs/ca.crt ]; then
+          echo "Creating CA PEM...";
+          keytool -exportcert \
+            -alias elastic-ca \
+            -keystore config/certs/elastic-ca.p12 \
+            -storetype PKCS12 \
+            -storepass "${CA_PASSWORD}" \
+            -rfc \
+            -file config/certs/ca.crt
+        fi;
+        
+        echo "Importing CA and signed cert into instance keystore…"
+        keytool -importcert \
+         -trustcacerts \
+         -noprompt \
+         -keystore config/certs/es01-keystore.jks \
+         -storepass "${CERT_PASSWORD}" \
+         -alias elastic-ca \
+         -file config/certs/ca.crt
+        keytool -importcert \
+         -noprompt \
+         -keystore config/certs/es01-keystore.jks \
+         -storepass "${CERT_PASSWORD}" \
+         -alias es01 \
+         -file config/certs/es01.crt;
+
+        echo "Exporting instance keystore to PKCS#12…"
+        keytool -importkeystore \
+         -srckeystore config/certs/es01-keystore.jks \
+         -srcstorepass "${CERT_PASSWORD}" \
+         -srcalias es01 \
+         -destkeystore config/certs/es01-http.p12 \
+         -deststoretype PKCS12 \
+         -deststorepass "${CERT_PASSWORD}" \
+         -destkeypass "${CERT_PASSWORD}";
+
+        echo "Importing CA PEM into truststore..."
+        keytool -importcert \
+          -alias elastic-ca \
+          -file config/certs/ca.crt \
+          -keystore config/certs/elastic-ca-trust.p12 \
+          -storetype PKCS12 \
+          -storepass "${CA_PASSWORD}" \
+          -trustcacerts -noprompt
+        echo "Importing es01 PEM into truststore..."
+        keytool -importcert \
+          -alias es01 \
+          -file config/certs/es01.crt \
+          -keystore config/certs/elastic-ca-trust.p12 \
+          -storetype PKCS12 \
+          -storepass "${CA_PASSWORD}" \
+          -trustcacerts -noprompt
+
+        echo "Setting file permissions"
+        chown -R root:root config/certs;
+        find . -type d -exec chmod 755 \{\} \;;
+        find . -type f -exec chmod 644 \{\} \;;
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca.crt https://es01:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
+        echo "Setting kibana_system password";
+        until curl -s -X POST --cacert config/certs/ca.crt -u "elastic:${ELASTIC_PASSWORD}" -H "Content-Type: application/json" https://es01:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "All done!";
+      '
+    healthcheck:
+      test: [ "CMD-SHELL", "[ -f config/certs/elastic-ca-trust.p12 ]" ]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+
+  es01:
+    depends_on:
+      setup:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - ./certs:/usr/share/elasticsearch/config/certs
+      - ./es01_data:/usr/share/elasticsearch/data
+    networks:
+      - data_collection_network
+    environment:
+      - node.name=es01
+      - cluster.name=${CLUSTER_NAME}
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.keystore.path=/usr/share/elasticsearch/config/certs/es01-http.p12
+      - xpack.security.http.ssl.keystore.password=${CERT_PASSWORD}
+      - xpack.security.http.ssl.truststore.path=/usr/share/elasticsearch/config/certs/elastic-ca-trust.p12
+      - xpack.security.http.ssl.truststore.type=PKCS12
+      - xpack.security.http.ssl.truststore.password=${CA_PASSWORD}
+      - xpack.security.http.ssl.verification_mode=certificate
+      
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.keystore.path=/usr/share/elasticsearch/config/certs/es01-http.p12
+      - xpack.security.transport.ssl.keystore.password=${CERT_PASSWORD}
+      - xpack.security.transport.ssl.truststore.path=/usr/share/elasticsearch/config/certs/elastic-ca-trust.p12
+      - xpack.security.transport.ssl.truststore.type=PKCS12
+      - xpack.security.transport.ssl.truststore.password=${CA_PASSWORD}
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=${LICENSE}
+#      - xpack.ml.use_auto_machine_memory_percent=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    ports:
+      - ${ES_PORT}:9200
+    healthcheck:
+      test:
+        [
+        "CMD-SHELL",
+        "curl -s --cacert config/certs/es01.crt https://es01:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    mem_limit: 1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+  kibana:
+    depends_on:
+      es01:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    volumes:
+      - ./certs:/usr/share/kibana/config/certs
+      - ./kibanadata:/usr/share/kibana/data
+    networks:
+      - data_collection_network
+    ports:
+      - ${KIBANA_PORT}:5601
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=https://es01:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - ELASTICSEARCH_SSL_TRUSTSTORE_PATH=/usr/share/kibana/config/certs/elastic-ca-trust.p12
+      - ELASTICSEARCH_SSL_TRUSTSTORE_PASSWORD=${CA_PASSWORD}
+    mem_limit: 1g
+
+volumes:
+  certs:
+    driver: local
+  es01_data:
+    driver: local
+  kibanadata:
+    driver: local
+

@@ -1,0 +1,4 @@
+FROM docker.elastic.co/elasticsearch/elasticsearch:8.18.3
+
+USER root
+RUN apt update -y && apt install -y default-jdk
